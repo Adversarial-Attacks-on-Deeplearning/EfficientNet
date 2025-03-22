@@ -1,5 +1,7 @@
 import numpy as np
 import tensorflow as tf
+from PIL import Image
+
 
 
 # GTSRB Class ID to Sign Name Mapping (43 classes)
@@ -50,19 +52,34 @@ GTSRB_CLASSES = {
 }
 
 
-def predict_traffic_sign(img_input, model, class_mapping=GTSRB_CLASSES):
-    """
-    Accepts either:
-    - Tensor (rank 3/4)
-    - Bytes (raw image bytes)
-    - File path (string)
-    """
 
+
+def load_ppm_image(image_path, target_size=(240, 240)):
+    # Open the .ppm image using Pillow
+    with Image.open(image_path) as img:
+        # Convert image to RGB (if not already)
+        img = img.convert("RGB")
+        # Resize the image to the target size (now 240x240)
+        img = img.resize(target_size)
+        # Convert image to numpy array
+        img_array = np.array(img)
+        # Convert numpy array to a TensorFlow tensor and cast to float32
+        img_tensor = tf.convert_to_tensor(img_array, dtype=tf.float32)
+        img_tensor = tf.expand_dims(img_tensor, axis=0)
+    return img_tensor
+
+
+
+def predict_traffic_sign(img_input, model, class_mapping):
+    """
+    Accepts a tensor (rank 3 or 4), raw image bytes, or a file path.
+    """
+    # Get predictions
     prop = model.predict(img_input)
-    print(prop.shape)
+    print("Prediction shape:", prop.shape)
     class_id = np.argmax(prop)
-    class_name = class_mapping[class_id]
-    return  class_name, prop[0][class_id]
+    print("Predicted class:", class_mapping[class_id])
+    return class_id
 
 
 

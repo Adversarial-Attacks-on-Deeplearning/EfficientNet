@@ -123,7 +123,3 @@ def is_adversarial(model, image, true_label):
     return predicted_class != true_label
 
 
-
-
-
-    
