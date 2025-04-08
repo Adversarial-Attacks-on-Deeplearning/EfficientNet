@@ -1,73 +1,76 @@
 import tensorflow as tf
+import numpy as np
 
-def deepfool_attack(model, image, true_label, max_iter=50, overshoot=0.02):
+def deepfool_attack(model, image, max_iter=50, overshoot=5):
     """
-    DeepFool attack implementation for a single image classification (e.g., EfficientNet).
+    DeepFool attack implementation for image classification using TensorFlow.
+    
+    This version is designed for an EfficientNet-based classification model that accepts
+    images with pixel values in [0, 255]. The attack iteratively perturbs the input image
+    until the predicted class changes.
     
     Args:
-        model: A Keras classification model that outputs logits.
-        image: A tensor of shape [H, W, C] with values in [0, 1] (preprocessed as required).
-        true_label: An integer representing the correct class index.
-        max_iter: Maximum number of iterations.
-        overshoot: Maximum allowed perturbation (per pixel) for the accumulated perturbation.
-        
+      model: tf.keras.Model that outputs logits.
+      image: tf.Tensor or numpy array with shape (1, H, W, C) containing the input image,
+             with pixel values in the range [0, 255].
+      max_iter: Maximum number of iterations for the attack.
+      overshoot: Maximum allowed perturbation per pixel (applied per update).
+      
     Returns:
-        pert_image: The perturbed (adversarial) image with shape [H, W, C].
-        r_total: The total perturbation applied, also with shape [H, W, C].
+      pert_image: The adversarially perturbed image as a numpy array.
+      r_total: The total accumulated perturbation as a numpy array.
     """
-    # Convert inputs to tensors
+    # Ensure image is a tf.Tensor with dtype float32.
     image = tf.convert_to_tensor(image, dtype=tf.float32)
-    true_label = tf.convert_to_tensor(true_label, dtype=tf.int32)
     
-    # Add a batch dimension if the image is single (shape: [H, W, C] -> [1, H, W, C])
-    if len(image.shape) == 3:
-        image = tf.expand_dims(image, axis=0)
-    if len(true_label.shape) == 0:
-        true_label = tf.expand_dims(true_label, axis=0)
+    # Get original prediction (assume batch size = 1)
+    output = model(image, training=False)
+    original_class = tf.argmax(output, axis=1)  # integer tensor of shape (1,)
     
-    # Initialize the total perturbation (r_total) as zeros
-    r_total = tf.zeros_like(image)
-    pert_image = tf.identity(image)
+    # Create a variable for the perturbed image
+    pert_image = tf.Variable(image)
     
-    # Small constant to prevent division by zero
-    epsilon_val = 1e-4
+    # Initialize the total perturbation to zeros
+    r_total = tf.zeros_like(image, dtype=tf.float32)
     
-    i = 0
-    while i < max_iter:
+    loop_i = 0
+    while loop_i < max_iter:
         with tf.GradientTape() as tape:
             tape.watch(pert_image)
-            logits = model(pert_image, training=False)
-            # Compute loss using sparse categorical crossentropy (from logits)
-            per_example_loss = tf.keras.losses.sparse_categorical_crossentropy(true_label, logits, from_logits=False)
-            loss = tf.reduce_mean(per_example_loss)
+            # Get the output logits for the current perturbed image.
+            output = model(pert_image, training=False)
+            
+            # For a single image, extract the logit for the original (correct) class.
+            correct_logit = output[0, original_class[0]]
+            # Define loss as negative of the correct class logit so that minimizing loss
+            # will drive that logit down.
+            loss = -correct_logit
         
-        # Compute gradients of loss with respect to pert_image
+        # Compute the gradient of the loss with respect to the input image.
         grad = tape.gradient(loss, pert_image)
-        # Normalize gradient per example
-        grad_reshaped = tf.reshape(grad, [grad.shape[0], -1])
-        norm = tf.norm(grad_reshaped, axis=1, keepdims=True) + 1e-8
-        norm = tf.reshape(norm, [-1, 1, 1, 1])
-        w = grad / norm
         
-        # Expand per-example loss for broadcasting
-        loss_expanded = tf.reshape(per_example_loss, [-1, 1, 1, 1])
-        # Compute the perturbation step for each example
-        r_i = (loss_expanded + epsilon_val) * w
+        # Normalize the gradient to obtain a unit vector.
+        norm_grad = tf.norm(grad) + 1e-8  # small epsilon to avoid division by zero
+        w = grad / norm_grad
         
-        # Update the accumulated perturbation and clip to allowed range
+        # Compute the incremental perturbation. The scaling factor (loss + 1e-4)
+        # determines the step size.
+        r_i = (loss + 1e-4) * w
+        
+        # Accumulate the perturbation and clip it so that per-pixel perturbation
+        # does not exceed the overshoot value.
         r_total = tf.clip_by_value(r_total + r_i, -overshoot, overshoot)
-        # Update the perturbed image and clip pixel values to [0, 1]
-        pert_image = tf.clip_by_value(image + r_total, 0.0, 1.0)
         
-        # Compute predictions using argmax over logits
-        preds = tf.argmax(model(pert_image, training=False), axis=1, output_type=tf.int32)
-        # Stop if the predicted label is no longer equal to the true label
-        if tf.reduce_all(tf.not_equal(preds, true_label)):
+        # Update the perturbed image and ensure pixel values remain in [0, 255].
+        pert_image.assign(tf.clip_by_value(image + r_total, 0.0, 255.0))
+        
+        # Check if the predicted class has changed.
+        new_output = model(pert_image, training=False)
+        new_class = tf.argmax(new_output, axis=1)
+        if new_class.numpy()[0] != original_class.numpy()[0]:
             break
         
-        i += 1
-        print(f"Iteration {i}: {preds.numpy()[0]}")
+        loop_i += 1
+        print(f"Iteration {loop_i}: Class predicted: {new_class.numpy()[0]}, ")
 
-    
-    
-    return pert_image, r_total
+    return pert_image.numpy(), r_total.numpy()
