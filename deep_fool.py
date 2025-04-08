@@ -1,76 +1,105 @@
 import tensorflow as tf
 import numpy as np
 
-def deepfool_attack(model, image, max_iter=50, overshoot=5):
+def deepfool_attack(
+    model, 
+    img_input, 
+    num_classes, 
+    max_iter=20, 
+    overshoot=0.02, 
+    eps=1e-6,
+    clip_min=0.0,
+    clip_max=255.0,
+    verbose=True
+):
     """
-    DeepFool attack implementation for image classification using TensorFlow.
-    
-    This version is designed for an EfficientNet-based classification model that accepts
-    images with pixel values in [0, 255]. The attack iteratively perturbs the input image
-    until the predicted class changes.
+    Perform DeepFool attack on a single image in the [0, 255] range.
     
     Args:
-      model: tf.keras.Model that outputs logits.
-      image: tf.Tensor or numpy array with shape (1, H, W, C) containing the input image,
-             with pixel values in the range [0, 255].
-      max_iter: Maximum number of iterations for the attack.
-      overshoot: Maximum allowed perturbation per pixel (applied per update).
-      
+        model: TF/Keras model (must output logits, not probabilities).
+        img_input: Input image tensor with shape (1, H, W, C) in [0, 255].
+        num_classes: Number of output classes.
+        max_iter: Maximum iterations (default: 50).
+        overshoot: Perturbation safety factor (default: 0.02).
+        eps: Small value to avoid division by zero.
+        clip_min/clip_max: Pixel value bounds (default: 0, 255).
+        verbose: Whether to print attack progress (default: True).
+        
     Returns:
-      pert_image: The adversarially perturbed image as a numpy array.
-      r_total: The total accumulated perturbation as a numpy array.
+        Adversarial image tensor (same shape as img_input).
     """
-    # Ensure image is a tf.Tensor with dtype float32.
-    image = tf.convert_to_tensor(image, dtype=tf.float32)
+    # Convert input to tensor and initialize variables
+    img_input = tf.convert_to_tensor(img_input, dtype=tf.float32)
+    adv_image = tf.Variable(img_input, trainable=True)
+    original_image = tf.identity(img_input)
+    total_perturbation = tf.Variable(tf.zeros_like(original_image), trainable=True)
     
-    # Get original prediction (assume batch size = 1)
-    output = model(image, training=False)
-    original_class = tf.argmax(output, axis=1)  # integer tensor of shape (1,)
+    # Get original prediction
+    original_logits = model(original_image)
+    original_class = tf.argmax(original_logits[0]).numpy()
     
-    # Create a variable for the perturbed image
-    pert_image = tf.Variable(image)
+    if verbose:
+        print(f"Initial prediction: Class {original_class}")
     
-    # Initialize the total perturbation to zeros
-    r_total = tf.zeros_like(image, dtype=tf.float32)
-    
-    loop_i = 0
-    while loop_i < max_iter:
+    for iteration in range(max_iter):
         with tf.GradientTape() as tape:
-            tape.watch(pert_image)
-            # Get the output logits for the current perturbed image.
-            output = model(pert_image, training=False)
-            
-            # For a single image, extract the logit for the original (correct) class.
-            correct_logit = output[0, original_class[0]]
-            # Define loss as negative of the correct class logit so that minimizing loss
-            # will drive that logit down.
-            loss = -correct_logit
+            tape.watch(adv_image)
+            logits = model(adv_image)
         
-        # Compute the gradient of the loss with respect to the input image.
-        grad = tape.gradient(loss, pert_image)
+        current_class = tf.argmax(logits[0]).numpy()
         
-        # Normalize the gradient to obtain a unit vector.
-        norm_grad = tf.norm(grad) + 1e-8  # small epsilon to avoid division by zero
-        w = grad / norm_grad
+        # Debug prints (before checking for success)
+        if verbose:
+            print(f"\nIteration {iteration}:")
+            print(f"  Current class: {current_class}")
         
-        # Compute the incremental perturbation. The scaling factor (loss + 1e-4)
-        # determines the step size.
-        r_i = (loss + 1e-4) * w
-        
-        # Accumulate the perturbation and clip it so that per-pixel perturbation
-        # does not exceed the overshoot value.
-        r_total = tf.clip_by_value(r_total + r_i, -overshoot, overshoot)
-        
-        # Update the perturbed image and ensure pixel values remain in [0, 255].
-        pert_image.assign(tf.clip_by_value(image + r_total, 0.0, 255.0))
-        
-        # Check if the predicted class has changed.
-        new_output = model(pert_image, training=False)
-        new_class = tf.argmax(new_output, axis=1)
-        if new_class.numpy()[0] != original_class.numpy()[0]:
+        # Check for misclassification
+        if current_class != original_class:
+            if verbose:
+                print(f"\nAttack succeeded at iteration {iteration}!")
+                print(f"Original class: {original_class} -> Adversarial class: {current_class}")
             break
         
-        loop_i += 1
-        print(f"Iteration {loop_i}: Class predicted: {new_class.numpy()[0]}, ")
-
-    return pert_image.numpy(), r_total.numpy()
+        # Compute gradients of all logits w.r.t. input
+        grads = tape.jacobian(logits, adv_image)  # Shape: (1, num_classes, 1, H, W, C)
+        grads = tf.squeeze(grads, axis=[0, 2])    # Remove batch dim -> (num_classes, H, W, C)
+        
+        logits_diff = logits[0] - logits[0, original_class]
+        min_perturb_norm = float('inf')
+        best_perturb = None
+        
+        # Find minimal perturbation across all classes
+        for k in range(num_classes):
+            if k == original_class:
+                continue
+            
+            w_k = grads[k] - grads[original_class]  # Shape: (H, W, C)
+            f_k = logits_diff[k]
+            
+            norm_w_k = tf.norm(tf.reshape(w_k, [-1]))
+            if norm_w_k < eps:
+                continue
+            
+            # Compute perturbation for class k
+            perturb_k = (tf.abs(f_k) / (norm_w_k**2 + eps)) * w_k
+            perturb_k = tf.expand_dims(perturb_k, axis=0)  # Add batch dim -> (1, H, W, C)
+            
+            perturb_k_norm = tf.norm(perturb_k)
+            if perturb_k_norm < min_perturb_norm:
+                min_perturb_norm = perturb_k_norm
+                best_perturb = perturb_k
+        
+        if best_perturb is None:
+            if verbose:
+                print("No valid perturbation found - terminating early")
+            break
+        
+        # Update perturbation and adversarial image
+        total_perturbation.assign_add(best_perturb)
+        adv_image.assign(original_image + (1 + overshoot) * total_perturbation)
+        adv_image.assign(tf.clip_by_value(adv_image, clip_min, clip_max))
+    
+    if verbose and current_class == original_class:
+        print("\nAttack failed to misclassify within max iterations")
+    
+    return adv_image.numpy()
